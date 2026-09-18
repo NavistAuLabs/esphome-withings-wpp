@@ -1,0 +1,17 @@
+# ESPHome build output and downloaded platform sources
+.esphome/
+.pioenvs/
+.piolibdeps/
+build/
+
+# Never commit device credentials
+secrets.yaml
+
+# Raw WPP session captures pulled off the card -- these are somebody's
+# measurement history, and the association key is what produced them.
+*.wpp
+
+__pycache__/
+*.py[cod]
+
+.DS_Store
