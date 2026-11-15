@@ -85,7 +85,7 @@ error, not a confusing auth failure days later.
 
 ```yaml
 external_components:
-  - source: github://NavistAuLabs/esphome-withings-wpp@v0.1.0
+  - source: github://NavistAuLabs/esphome-withings-wpp@v0.2.0
     components: [withings_wpp]
   # SD card mount for the raw captures. Pinned at the commit upstream's v0.2.0
   # tag points at: a branch moves, and a tag can be repointed.
@@ -242,9 +242,9 @@ the component handles itself.
 
 ### 4. Confirm a weigh-in arrives
 
-Stand on the scale. It advertises for roughly 55 seconds after a weigh-in, the
-component connects on sight, and a full authenticate-read-release cycle takes
-about three seconds. You should see the sensors update, and — if a card is
+Stand on the scale. It advertises for roughly 55 seconds after a weigh-in. The
+component connects once, on the first advertisement after five minutes with
+none, and a full authenticate-read-release cycle takes about three seconds. You should see the sensors update, and — if a card is
 mounted — a session file promoted out of `.partial/`.
 
 Nothing here polls, and nothing can wake the scale remotely: if nobody stands
@@ -323,9 +323,12 @@ timestamp if you want to watch it.
 **Nothing happens when someone weighs themselves.** The scale is only on the
 air for about 55 seconds after a weigh-in and cannot be woken, so first make
 sure the window had not already closed. Then check for the component's
-per-advertisement log line, which is at `VERBOSE` — if your logger is above
-that level you cannot tell a listener that is never called from one that is
-working, because `esp32_ble_tracker` logs nothing per advertisement of its own.
+`Started advertising` line at `DEBUG`, logged once per appearance; every
+further advertisement is logged at `VERBOSE`. Without them you cannot tell a
+listener that is never called from one that is working, because
+`esp32_ble_tracker` logs nothing per advertisement of its own. A scale seen
+again within five minutes of its last advertisement counts as the same
+weigh-in and is not reconnected.
 Then check the connect: a weigh-in seen while the client is not `IDLE` is
 logged and dropped, since an edge is a one-shot. Nothing is permanently lost
 either way; the next sync re-serves everything.

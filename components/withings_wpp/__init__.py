@@ -23,9 +23,13 @@ Takes an existing `ble_client` rather than defining its own, because the
 passkey pairing automations that bond the scale are config-side and belong on
 that entry. The component drives the link itself from there: it listens for
 the scale's advertisement (the scale only advertises after a weigh-in, so the
-advertisement IS the event), calls connect on the absent->present edge, and
-speaks WPP from ESP_GATTC_SEARCH_CMPL_EVT onward. A `ble_client.connect`
-action fired from elsewhere -- a button, say -- starts a run just as well.
+advertisement IS the event) and connects once on the first advertisement seen
+after QUIET_PERIOD_MS (5 min, withings_wpp.cpp) with none -- not on every
+edge, so a slow/retried connect within one ~55s advertising burst can't
+re-trigger a second run against the same weigh-in -- then speaks WPP from
+ESP_GATTC_SEARCH_CMPL_EVT onward. A `ble_client.connect` action fired from
+elsewhere -- a "pair now" button, say -- starts a run just as well,
+independent of the quiet-period state.
 """
 
 import esphome.codegen as cg

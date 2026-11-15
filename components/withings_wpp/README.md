@@ -19,9 +19,15 @@ after someone stands on it, and cannot be woken remotely. There is no
 polling, no scheduling, no "sync now" from cold.
 
 So the component is an **advertisement listener** as well as a GATT client:
-an advertisement *is* the weigh-in event, and it connects on sight. A
-full authenticate-read-release cycle takes about 3 seconds, comfortably
-inside the window.
+an advertisement *is* the weigh-in event, and it connects once on the first
+advertisement seen after `QUIET_PERIOD_MS` (5 minutes) with none -- not on
+every advertisement, so it doesn't reconnect mid-burst if the first attempt
+is still in flight or has already finished. A full authenticate-read-release
+cycle takes about 3 seconds, comfortably inside the ~55s window. There is no
+retry: a failed attempt is picked up by the next weigh-in (or a manual
+"Withings Pair Now" press) because the scale re-serves its whole store on
+every connect (never `DELALL` -- see below), so nothing is lost, only
+delayed.
 
 It matches on the **`WITH` service UUID** (`00000020-5749-5448`, "5749 5448"
 being ASCII "WITH"), not on the MAC. The scale advertises a *static random*
@@ -210,7 +216,7 @@ unanswerable from outside the board.
 
 **Connects fail roughly half the time** with `ESP_GATT_CONN_CONN_CANCEL`
 (reason `0x100`) then `OPEN_EVT status=133`, after a 20-second timeout —
-cancelled locally, not refused. The presence timeout must exceed 20s or a
+cancelled locally, not refused. The quiet period must exceed 20s or a
 failed connect expires it and fakes a fresh wake edge.
 
 **The bond survives reflashing.** It lives in ESP-IDF NVS keyed by peer

@@ -11,6 +11,32 @@ those are the changes that break a consumer without breaking a build.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-15
+
+### Changed
+
+- The advertisement trigger now connects once per weigh-in: on the first
+  advertisement seen after five minutes with none, rather than on the
+  absent-to-present edge of a 60-second presence window. A slow or retried
+  connect inside one ~55-second advertising burst no longer re-triggers a
+  second session against the same weigh-in. The five minutes is fixed, not
+  configurable.
+- Connect, connect failure, idle disconnect, the encrypted-link confirmation,
+  the first advertisement of each appearance and the end of the quiet period
+  are logged at `DEBUG`.
+
+### Fixed
+
+- First-time pairing no longer aborts. When the notify subscribe is refused
+  for insufficient authentication while the passkey pairing is still in
+  flight, the component now waits for the pairing to finish (up to 45
+  seconds) and retries the subscribe once, instead of releasing the link and
+  cancelling the pairing (auth fail reason `0x66`).
+- A session with a scale in setup mode is closed the way Health Mate closes
+  it, with `CMD_SYNC_OK` then `CMD_SETUP_OK`, instead of failing on the
+  unexpected probe reply and leaving the scale showing "Setup failed". No
+  keys are written.
+
 ## [0.1.0] - 2026-09-18
 
 First public release.

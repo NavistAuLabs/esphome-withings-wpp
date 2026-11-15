@@ -27,6 +27,17 @@ namespace withings_wpp {
 
 static const char *const TAG = "withings_wpp";
 
+// The scale is silent when idle and advertises only for ~55s after a
+// weigh-in/button press, so a "quiet period with no advertisement" is what
+// distinguishes one weigh-in event from another. 5 minutes is comfortably
+// longer than a single ~55s burst (including a slow/retried connect inside
+// it) and far shorter than the gap between real uses of the scale. It must
+// also exceed the ~20s BLE connect timeout: the tracker reports no
+// advertisements while a connect is in flight, so a shorter window would
+// expire presence mid-attempt and turn the next advertisement into a false
+// "just started" edge before the real burst has even ended.
+static const uint32_t QUIET_PERIOD_MS = 5 * 60 * 1000;
+
 // Fixed mount point of the sd_mmc_card component (not configurable there). A
 // capture in progress lives under <SD_ROOT>/.partial/withings/<mac>/ until
 // CMD_SYNC_OK is acknowledged; see promote_session_file_().
@@ -290,6 +301,28 @@ void WithingsWpp::dump_config() {
   ESP_LOGCONFIG(TAG, "  MAC Address: %s", this->parent()->address_str());
 }
 
+void WithingsWpp::gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) {
+  if (event != ESP_GAP_BLE_AUTH_CMPL_EVT || !this->awaiting_encryption_ || this->state_ != State::SUBSCRIBING)
+    return;
+  const auto &cmpl = param->ble_security.auth_cmpl;
+  if (memcmp(cmpl.bd_addr, this->parent()->get_remote_bda(), sizeof(esp_bd_addr_t)) != 0)
+    return;
+  this->awaiting_encryption_ = false;
+  this->cancel_timeout("encrypt");
+  if (!cmpl.success) {
+    ESP_LOGW(TAG, "[%s] Pairing/encryption failed, reason=0x%x", this->parent()->address_str(), cmpl.fail_reason);
+    this->finish_(false, "pairing/encryption failed");
+    return;
+  }
+  ESP_LOGD(TAG, "[%s] Link encrypted -- retrying the subscribe", this->parent()->address_str());
+  this->subscribe_retried_ = true;
+  auto status = this->parent()->register_for_notify(this->char_handle_);
+  if (status != ESP_OK) {
+    ESP_LOGW(TAG, "[%s] register_for_notify retry failed, status=%d", this->parent()->address_str(), status);
+    this->finish_(false, "register_for_notify retry failed");
+  }
+}
+
 void WithingsWpp::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
                                        esp_ble_gattc_cb_param_t *param) {
   switch (event) {
@@ -301,6 +334,15 @@ void WithingsWpp::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t 
         // not that we asked for it.
         ESP_LOGW(TAG, "[%s] Disconnected mid-handshake (state=%d) -- link dropped before finishing",
                  this->parent()->address_str(), (int) this->state_);
+      } else if (this->state_ == State::IDLE) {
+        // Reached without ever getting to SEARCH_CMPL_EVT below: either a raw
+        // connect attempt failed (the flakiness the README describes) or this
+        // is an intentional disconnect (e.g. a "pair now" button's own
+        // ble_client.disconnect before it reconnects). DEBUG, not WARN --
+        // both are routine, but connect start/success/fail should all be
+        // visible.
+        ESP_LOGD(TAG, "[%s] Disconnected (state=IDLE, reason=%d) -- no session was in progress",
+                 this->parent()->address_str(), (int) param->disconnect.reason);
       }
       this->state_ = State::IDLE;
       this->char_handle_ = 0;
@@ -322,8 +364,13 @@ void WithingsWpp::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t 
     }
 
     case ESP_GATTC_OPEN_EVT: {
-      if (param->open.status != ESP_GATT_OK)
+      if (param->open.status != ESP_GATT_OK) {
+        ESP_LOGW(TAG, "[%s] Connect failed, status=%d", this->parent()->address_str(), (int) param->open.status);
         break;
+      }
+      ESP_LOGD(TAG, "[%s] Connected", this->parent()->address_str());
+      this->awaiting_encryption_ = false;
+      this->subscribe_retried_ = false;
       // REQUEST ENCRYPTION ON EVERY CONNECT, not just at pairing. A bond is
       // key material, not an encrypted link: reconnecting to an already-bonded
       // scale comes up plaintext unless this is called again, and it then
@@ -387,6 +434,26 @@ void WithingsWpp::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t 
     case ESP_GATTC_WRITE_DESCR_EVT: {
       if (this->state_ != State::SUBSCRIBING)
         break;  // not our CCCD write (or already handled)
+      if (param->write.status == ESP_GATT_INSUF_AUTHENTICATION && !this->subscribe_retried_) {
+        // The encryption requested on OPEN_EVT is still in flight -- for an
+        // unbonded scale that is a full passkey pairing, which takes as long
+        // as a human needs to read the code. Releasing the link here aborts
+        // that pairing (auth fail reason=102), so wait for GAP AUTH_CMPL and
+        // retry the subscribe from gap_event_handler() instead. Once only: a
+        // second failure after encryption completed falls through below.
+        ESP_LOGD(TAG, "[%s] Subscribe needs an encrypted link -- waiting for pairing/encryption to complete",
+                 this->parent()->address_str());
+        this->awaiting_encryption_ = true;
+        // Bounded: a passkey pairing holds ~28 s (see the YAML's
+        // on_passkey_request), so 45 s covers it and never leaves the link held.
+        this->set_timeout("encrypt", 45000, [this]() {
+          if (!this->awaiting_encryption_ || this->state_ != State::SUBSCRIBING)
+            return;
+          this->awaiting_encryption_ = false;
+          this->finish_(false, "timed out waiting for pairing/encryption");
+        });
+        break;
+      }
       if (param->write.status != ESP_GATT_OK) {
         // Insufficient Authentication here means the exact opposite of what
         // it looks like: the device IS bonded, but esp_ble_set_encryption
@@ -402,6 +469,7 @@ void WithingsWpp::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t 
         this->finish_(false, "notify-enable write failed");
         break;
       }
+      ESP_LOGD(TAG, "[%s] Encrypted link confirmed (notify-enable write succeeded)", this->parent()->address_str());
       this->node_state = espbt::ClientState::ESTABLISHED;
       this->state_ = State::AWAITING_CHALLENGE;
       this->send_probe_();
@@ -479,10 +547,42 @@ void WithingsWpp::handle_frame_(uint16_t cmd, const std::vector<uint8_t> &payloa
         this->handle_cmd_error_(payload);
       } else if (cmd == CMD_PROBE_CHALLENGE) {
         this->handle_probe_challenge_(payload);
+      } else if (cmd == CMD_PROBE) {
+        // Setup mode answers the probe directly (ProbeReply + FactoryState)
+        // instead of challenging. Finish the setup session: SYNC_OK, then
+        // SETUP_OK, the way the Health Mate app closes a setup session.
+        ESP_LOGI(TAG, "[%s] Setup mode (ProbeReply, no challenge) -- sending SYNC_OK then SETUP_OK",
+                 this->parent()->address_str());
+        this->state_ = State::AWAITING_SETUP_SYNC_OK;
+        this->send_frame_(CMD_SYNC_OK, {});
       } else {
         ESP_LOGW(TAG, "[%s] Expected CMD_PROBE_CHALLENGE, got cmd=%u -- unexpected reply shape",
                  this->parent()->address_str(), cmd);
         this->finish_(false, "unexpected reply awaiting challenge");
+      }
+      break;
+
+    case State::AWAITING_SETUP_SYNC_OK:
+      if (cmd == CMD_ERROR) {
+        this->handle_cmd_error_(payload);
+      } else if (cmd == CMD_SYNC_OK) {
+        this->state_ = State::AWAITING_SETUP_OK;
+        this->send_frame_(CMD_SETUP_OK, {});
+      } else {
+        ESP_LOGW(TAG, "[%s] Expected CMD_SYNC_OK echo in setup mode, got cmd=%u", this->parent()->address_str(), cmd);
+        this->finish_(false, "unexpected reply awaiting setup-mode SYNC_OK");
+      }
+      break;
+
+    case State::AWAITING_SETUP_OK:
+      if (cmd == CMD_ERROR) {
+        this->handle_cmd_error_(payload);
+      } else if (cmd == CMD_SETUP_OK) {
+        ESP_LOGI(TAG, "[%s] Setup completed (SETUP_OK acknowledged)", this->parent()->address_str());
+        this->finish_(true, nullptr);
+      } else {
+        ESP_LOGW(TAG, "[%s] Expected CMD_SETUP_OK echo, got cmd=%u", this->parent()->address_str(), cmd);
+        this->finish_(false, "unexpected reply awaiting SETUP_OK");
       }
       break;
 
@@ -1046,22 +1146,27 @@ bool WithingsWpp::parse_device(const ble_device_base::ESPBTDevice &device) {
     this->parent()->set_address(device.address_uint64());
   }
 
-  // VERBOSE, not VERY_VERBOSE: the device logger runs at VERBOSE and compiles
-  // VV statements out entirely, which looks exactly like a listener that is
-  // never called. esp32_ble_tracker logs nothing per-advertisement of its own,
-  // so without this there is no way to tell the two apart from outside.
-  ESP_LOGV(TAG, "[%s] advertisement seen (present=%d)", this->parent()->address_str(), (int) this->scale_present_);
-
   const bool was_present = this->scale_present_;
   this->scale_present_ = true;
   // Must exceed the 20s BLE connect timeout: the tracker reports no
   // advertisements while a connect is in flight, so a shorter window expires
   // presence during every failed attempt and fakes a fresh edge afterwards.
   this->cancel_timeout("presence");
-  this->set_timeout("presence", 60000, [this]() { this->scale_present_ = false; });
+  this->set_timeout("presence", QUIET_PERIOD_MS, [this]() { this->on_quiet_period_elapsed_(); });
 
-  if (was_present)
+  if (was_present) {
+    // VERBOSE, not VERY_VERBOSE: the device logger runs at VERBOSE and
+    // compiles VV statements out entirely, which looks exactly like a
+    // listener that is never called. esp32_ble_tracker logs nothing
+    // per-advertisement of its own, so without this there is no way to tell
+    // the two apart from outside.
+    ESP_LOGV(TAG, "[%s] advertisement seen (present=1)", this->parent()->address_str());
     return true;
+  }
+
+  // DEBUG, not VERBOSE: this is the one line per appearance that shows a
+  // weigh-in event starting at all.
+  ESP_LOGD(TAG, "[%s] Started advertising, rssi=%d", this->parent()->address_str(), device.get_rssi());
 
   const uint32_t now = millis();
   if (this->parent()->state() != espbt::ClientState::IDLE) {
@@ -1085,6 +1190,12 @@ bool WithingsWpp::parse_device(const ble_device_base::ESPBTDevice &device) {
   this->last_attempt_ms_ = now;
   this->parent()->connect();
   return true;
+}
+
+void WithingsWpp::on_quiet_period_elapsed_() {
+  this->scale_present_ = false;
+  ESP_LOGD(TAG, "[%s] Quiet for %us -- next advertisement will be treated as a fresh weigh-in",
+           this->parent()->address_str(), (unsigned) (QUIET_PERIOD_MS / 1000));
 }
 
 void WithingsWpp::finish_(bool success, const char *reason) {

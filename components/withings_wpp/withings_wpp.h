@@ -49,6 +49,7 @@ static const uint16_t CMD_TIME_SET = 1281;
 static const uint16_t CMD_CONNECT_REASON = 273;
 static const uint16_t CMD_STORED_MEASURE = 271;
 static const uint16_t CMD_SYNC_OK = 277;
+static const uint16_t CMD_SETUP_OK = 275;
 
 // TLV object type ids used while authenticating.
 static const uint16_t T_APP_PROBE = 298;
@@ -189,6 +190,11 @@ enum class State : uint8_t {
   AWAITING_STORED_STATUS,   // GETSTATE sent, waiting for StoredMeasureStatus
   AWAITING_STORED_DATA,     // GETALL sent, accumulating Meta/MetaExtend/Data until Null
   AWAITING_SYNC_OK,         // CMD_SYNC_OK sent, waiting for the scale's ack -- promotion gate
+  // Setup mode: the probe got ProbeReply instead of a challenge. Close the
+  // session the way Health Mate does -- SYNC_OK then SETUP_OK -- or the
+  // display shows "Setup failed". No keys are written.
+  AWAITING_SETUP_SYNC_OK,   // CMD_SYNC_OK sent in a setup-mode session
+  AWAITING_SETUP_OK,        // CMD_SETUP_OK sent, waiting for its echo
   DONE,                     // finished (synced or failed); link is being/has been released
 };
 
@@ -202,13 +208,19 @@ class WithingsWpp : public Component,
 
   /// Advertisement listener. The scale is SILENT when idle -- it advertises
   /// only for roughly 55 seconds after someone stands on it, and cannot be
-  /// woken remotely. So an advertisement IS the weigh-in event, and the only
-  /// workable trigger is to be permanently armed and connect on sight.
+  /// woken remotely. So an advertisement IS the weigh-in event: connect once
+  /// on the first advertisement seen after QUIET_PERIOD_MS with none (the
+  /// off-air -> on-air edge), then stay quiet for the rest of the same
+  /// advertising burst -- see withings_wpp.cpp's parse_device()/
+  /// on_quiet_period_elapsed_().
   bool parse_device(const ble_device_base::ESPBTDevice &device) override;
   float get_setup_priority() const override { return setup_priority::AFTER_BLUETOOTH; }
 
   void gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
                             esp_ble_gattc_cb_param_t *param) override;
+  /// Retries the subscribe once a pending pairing/encryption completes -- see
+  /// ESP_GATTC_WRITE_DESCR_EVT in the .cpp.
+  void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) override;
 
   void set_association_key(const std::string &kl) { this->association_key_ = kl; }
   void set_time_id(time::RealTimeClock *t) { this->time_ = t; }
@@ -253,12 +265,23 @@ class WithingsWpp : public Component,
   /// Enter DONE and release the link -- every terminal path (success,
   /// protocol error, reply timeout) routes through this. Never just set the
   /// state. `reason` is only used (and may be nullptr) when !success.
+  void finish_(bool success, const char *reason);
+  /// Fires QUIET_PERIOD_MS after the last advertisement -- the scale has been
+  /// silent long enough to treat the NEXT advertisement as a fresh weigh-in
+  /// rather than a straggler from the same burst. See withings_wpp.cpp.
+  void on_quiet_period_elapsed_();
+
+  // scale_present_/last_attempt_ms_ are the quiet-period trigger's state --
+  // see parse_device()/on_quiet_period_elapsed_() in the .cpp.
   bool scale_present_{false};
   uint32_t last_attempt_ms_{0};
-  void finish_(bool success, const char *reason);
 
   WppFrameCodec codec_;
   State state_{State::IDLE};
+  // The subscribe hit Insufficient Authentication and is waiting for the
+  // encryption/pairing in flight to finish (GAP AUTH_CMPL) before retrying.
+  bool awaiting_encryption_{false};
+  bool subscribe_retried_{false};
   uint16_t char_handle_{0};
   std::string association_key_;
   time::RealTimeClock *time_{nullptr};
